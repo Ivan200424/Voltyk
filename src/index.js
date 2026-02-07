@@ -133,8 +133,12 @@ if (config.botMode === 'webhook') {
   });
 } else {
   // Polling mode (default)
-  bot.start();
-  console.log('✨ Бот успішно запущено та готовий до роботи (polling режим)!');
+  bot.start({
+    drop_pending_updates: true,
+    onStart: (botInfo) => {
+      console.log(`✨ Бот успішно запущено та готовий до роботи (polling режим)!`);
+    }
+  });
 }
 
 // Обробка сигналів завершення
