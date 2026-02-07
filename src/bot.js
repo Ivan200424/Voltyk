@@ -1,4 +1,4 @@
-const { Bot, InputFile } = require('grammy');
+const { Bot, InputFile, GrammyError, HttpError } = require('grammy');
 const { autoRetry } = require('@grammyjs/auto-retry');
 const { apiThrottler } = require('@grammyjs/transformer-throttler');
 const config = require('./config');
@@ -31,7 +31,7 @@ const { getMainMenu, getHelpKeyboard, getStatisticsKeyboard, getSettingsKeyboard
 const { REGIONS } = require('./constants/regions');
 const { formatErrorMessage } = require('./formatter');
 const { generateLiveStatusMessage, escapeHtml } = require('./utils');
-const { safeEditMessageText } = require('./utils/errorHandler');
+const { safeEditMessageText, safeAnswerCallbackQuery } = require('./utils/errorHandler');
 
 // Store pending channel connections
 const pendingChannels = new Map();
@@ -201,7 +201,7 @@ bot.on("callback_query:data", async (ctx) => {
         const user = usersDb.getUserByTelegramId(telegramId);
         
         if (!user) {
-          await bot.api.answerCallbackQuery(query.id, {
+          await safeAnswerCallbackQuery(bot, query.id, {
             text: '❌ Користувач не знайдений',
             show_alert: true
           });
@@ -230,7 +230,7 @@ bot.on("callback_query:data", async (ctx) => {
               }
             }
           );
-          await bot.api.answerCallbackQuery(query.id);
+          await safeAnswerCallbackQuery(bot, query.id);
           return;
         }
         
@@ -288,7 +288,7 @@ bot.on("callback_query:data", async (ctx) => {
           }
         );
       }
-      await bot.api.answerCallbackQuery(query.id);
+      await safeAnswerCallbackQuery(bot, query.id);
       return;
     }
 
@@ -304,7 +304,7 @@ bot.on("callback_query:data", async (ctx) => {
         const user = usersDb.getUserByTelegramId(telegramId);
         
         if (!user) {
-          await bot.api.answerCallbackQuery(query.id, {
+          await safeAnswerCallbackQuery(bot, query.id, {
             text: '❌ Користувач не знайдений',
             show_alert: true
           });
@@ -319,13 +319,13 @@ bot.on("callback_query:data", async (ctx) => {
         // Remove HTML tags for popup
         const cleanMessage = message.replace(/<[^>]*>/g, '');
         
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: cleanMessage,
           show_alert: true
         });
       } catch (error) {
         console.error('Помилка отримання таймера:', error);
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: '😅 Щось пішло не так. Спробуй ще раз!',
           show_alert: true
         });
@@ -343,7 +343,7 @@ bot.on("callback_query:data", async (ctx) => {
         const user = usersDb.getUserByTelegramId(telegramId);
         
         if (!user) {
-          await bot.api.answerCallbackQuery(query.id, {
+          await safeAnswerCallbackQuery(bot, query.id, {
             text: '❌ Користувач не знайдений',
             show_alert: true
           });
@@ -353,13 +353,13 @@ bot.on("callback_query:data", async (ctx) => {
         const stats = getWeeklyStats(user.id);
         const message = formatStatsPopup(stats);
         
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: message,
           show_alert: true
         });
       } catch (error) {
         console.error('Помилка отримання статистики:', error);
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: '😅 Щось пішло не так. Спробуй ще раз!',
           show_alert: true
         });
@@ -379,7 +379,7 @@ bot.on("callback_query:data", async (ctx) => {
           reply_markup: getHelpKeyboard().reply_markup,
         }
       );
-      await bot.api.answerCallbackQuery(query.id);
+      await safeAnswerCallbackQuery(bot, query.id);
       return;
     }
 
@@ -389,7 +389,7 @@ bot.on("callback_query:data", async (ctx) => {
       const user = usersDb.getUserByTelegramId(telegramId);
       
       if (!user) {
-        await bot.api.answerCallbackQuery(query.id, { text: '❌ Спочатку налаштуйте бота командою /start' });
+        await safeAnswerCallbackQuery(bot, query.id, { text: '❌ Спочатку налаштуйте бота командою /start' });
         return;
       }
       
@@ -408,7 +408,7 @@ bot.on("callback_query:data", async (ctx) => {
           reply_markup: getSettingsKeyboard(isAdmin).reply_markup,
         }
       );
-      await bot.api.answerCallbackQuery(query.id);
+      await safeAnswerCallbackQuery(bot, query.id);
       return;
     }
 
@@ -468,7 +468,7 @@ bot.on("callback_query:data", async (ctx) => {
           );
         }
       }
-      await bot.api.answerCallbackQuery(query.id);
+      await safeAnswerCallbackQuery(bot, query.id);
       return;
     }
     
@@ -506,7 +506,7 @@ bot.on("callback_query:data", async (ctx) => {
         
         const user = usersDb.getUserById(userId);
         if (!user) {
-          await bot.api.answerCallbackQuery(query.id, {
+          await safeAnswerCallbackQuery(bot, query.id, {
             text: '❌ Користувач не знайдений',
             show_alert: true
           });
@@ -614,13 +614,13 @@ bot.on("callback_query:data", async (ctx) => {
         
         const message = lines.join('\n');
         
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: message,
           show_alert: true
         });
       } catch (error) {
         console.error('Помилка обробки timer callback:', error);
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: '😅 Щось пішло не так. Спробуй ще раз!',
           show_alert: true
         });
@@ -636,7 +636,7 @@ bot.on("callback_query:data", async (ctx) => {
         
         const user = usersDb.getUserById(userId);
         if (!user) {
-          await bot.api.answerCallbackQuery(query.id, {
+          await safeAnswerCallbackQuery(bot, query.id, {
             text: '❌ Користувач не знайдений',
             show_alert: true
           });
@@ -692,13 +692,13 @@ bot.on("callback_query:data", async (ctx) => {
         
         const message = lines.join('\n');
         
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: message,
           show_alert: true
         });
       } catch (error) {
         console.error('Помилка обробки stats callback:', error);
-        await bot.api.answerCallbackQuery(query.id, {
+        await safeAnswerCallbackQuery(bot, query.id, {
           text: '😅 Щось пішло не так. Спробуй ще раз!',
           show_alert: true
         });
@@ -740,12 +740,12 @@ bot.on("callback_query:data", async (ctx) => {
           }
         }
       );
-      await bot.api.answerCallbackQuery(query.id);
+      await safeAnswerCallbackQuery(bot, query.id);
       return;
     }
     
     if (data === 'help_faq') {
-      await bot.api.answerCallbackQuery(query.id, {
+      await safeAnswerCallbackQuery(bot, query.id, {
         text: help_faq,
         show_alert: true
       });
@@ -753,11 +753,11 @@ bot.on("callback_query:data", async (ctx) => {
     }
     
     // Default: just acknowledge
-    await bot.api.answerCallbackQuery(query.id);
+    await safeAnswerCallbackQuery(bot, query.id);
     
   } catch (error) {
     console.error('Помилка обробки callback query:', error);
-    await bot.api.answerCallbackQuery(query.id, {
+    await safeAnswerCallbackQuery(bot, query.id, {
       text: '❌ Виникла помилка',
       show_alert: false
     });
@@ -1016,6 +1016,20 @@ bot.on("my_chat_member", async (ctx) => {
     
   } catch (error) {
     console.error('Error in my_chat_member handler:', error);
+  }
+});
+
+// Global error handler to prevent bot crashes
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`❌ Error while handling update ${ctx.update.update_id}:`);
+  const e = err.error;
+  if (e instanceof GrammyError) {
+    console.error("Grammy error:", e.description);
+  } else if (e instanceof HttpError) {
+    console.error("HTTP error:", e);
+  } else {
+    console.error("Unknown error:", e);
   }
 });
 

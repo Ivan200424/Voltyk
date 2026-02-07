@@ -146,6 +146,11 @@ async function safeAnswerCallbackQuery(bot, callbackQueryId, options = {}) {
     await bot.api.answerCallbackQuery(callbackQueryId, options);
     return true;
   } catch (error) {
+    // Ignore old callback queries
+    if (error.description?.includes('query is too old')) {
+      // This is normal - user clicked on an old button
+      return false;
+    }
     logger.error(`Помилка відповіді на callback query:`, { error: error.message });
     return false;
   }
