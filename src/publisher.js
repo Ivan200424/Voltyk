@@ -1,0 +1,385 @@
+const { InputFile } = require('grammy');
+const { fetchScheduleData, fetchScheduleImage } = require('./api');
+const { parseScheduleForQueue, findNextEvent } = require('./parser');
+const { formatScheduleMessage, formatTemplate } = require('./formatter');
+const { getLastSchedule, getPreviousSchedule, addScheduleToHistory, compareSchedules } = require('./database/scheduleHistory');
+const usersDb = require('./database/users');
+const { REGIONS } = require('./constants/regions');
+const crypto = require('crypto');
+
+// Get monitoring manager
+let metricsCollector = null;
+let capacityTracker = null;
+try {
+  metricsCollector = require('./monitoring/metricsCollector');
+  capacityTracker = require('./monitoring/capacityTracker');
+} catch (e) {
+  // Monitoring not available yet, will work without it
+}
+
+// Day name constants
+const DAY_NAMES = ['Неділя', 'Понеділок', 'Вівторок', 'Середа', 'Четвер', 'П\'ятниця', 'Субота'];
+const SHORT_DAY_NAMES = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+
+// Helper function to get bot ID (cached in bot.options.id)
+async function ensureBotId(bot) {
+  if (!bot.options.id) {
+    const botInfo = await bot.api.getMe();
+    bot.options.id = botInfo.id;
+  }
+  return bot.options.id;
+}
+
+// Визначити тип оновлення графіка з snapshot logic
+function getUpdateTypeV2(previousSchedule, currentSchedule, userSnapshots) {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrowStart = new Date(todayStart);
+  tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+  const tomorrowEnd = new Date(tomorrowStart);
+  tomorrowEnd.setDate(tomorrowEnd.getDate() + 1);
+  
+  // Get tomorrow date string (YYYY-MM-DD)
+  const tomorrowDateStr = tomorrowStart.toISOString().split('T')[0];
+  
+  // Split events into today and tomorrow
+  const currentTodayEvents = currentSchedule.events ? currentSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= todayStart && eventStart < tomorrowStart;
+  }) : [];
+  
+  const currentTomorrowEvents = currentSchedule.events ? currentSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= tomorrowStart && eventStart < tomorrowEnd;
+  }) : [];
+  
+  // Calculate hashes for today and tomorrow using helper
+  const todayHash = calculateScheduleHash(currentTodayEvents);
+  const tomorrowHash = calculateScheduleHash(currentTomorrowEvents);
+  
+  // Check if snapshots changed
+  const todayChanged = userSnapshots?.today_snapshot_hash !== todayHash;
+  const tomorrowChanged = userSnapshots?.tomorrow_snapshot_hash !== tomorrowHash;
+  
+  // Check if tomorrow was already published for this date
+  const tomorrowAlreadyPublished = userSnapshots?.tomorrow_published_date === tomorrowDateStr;
+  
+  // Determine if tomorrow just appeared (new data and wasn't published for this date)
+  const tomorrowAppeared = currentTomorrowEvents.length > 0 && 
+                          tomorrowChanged && 
+                          !tomorrowAlreadyPublished;
+  
+  return {
+    todayChanged,
+    tomorrowChanged,
+    tomorrowAppeared,
+    todayHash,
+    tomorrowHash,
+    tomorrowDateStr,
+    hasTomorrow: currentTomorrowEvents.length > 0,
+  };
+}
+
+// Helper function to calculate schedule hash
+function calculateScheduleHash(events) {
+  return crypto.createHash('md5').update(JSON.stringify(events)).digest('hex');
+}
+
+// Визначити тип оновлення графіка
+function getUpdateType(previousSchedule, currentSchedule) {
+  // Split events into today and tomorrow
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrowStart = new Date(todayStart);
+  tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+  const tomorrowEnd = new Date(tomorrowStart);
+  tomorrowEnd.setDate(tomorrowEnd.getDate() + 1);
+  
+  // Get tomorrow events from current schedule
+  const currentTomorrowEvents = currentSchedule.events ? currentSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= tomorrowStart && eventStart < tomorrowEnd;
+  }) : [];
+  
+  // Get tomorrow events from previous schedule
+  const previousTomorrowEvents = previousSchedule && previousSchedule.events ? previousSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= tomorrowStart && eventStart < tomorrowEnd;
+  }) : [];
+  
+  // Get today events from current schedule
+  const todayEnd = new Date(todayStart);
+  todayEnd.setHours(23, 59, 59, 999);
+  const currentTodayEvents = currentSchedule.events ? currentSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= todayStart && eventStart <= todayEnd;
+  }) : [];
+  
+  // Get today events from previous schedule
+  const previousTodayEvents = previousSchedule && previousSchedule.events ? previousSchedule.events.filter(event => {
+    const eventStart = new Date(event.start);
+    return eventStart >= todayStart && eventStart <= todayEnd;
+  }) : [];
+  
+  const hadTomorrow = previousTomorrowEvents.length > 0;
+  const hasTomorrow = currentTomorrowEvents.length > 0;
+  const todayChanged = JSON.stringify(previousTodayEvents) !== JSON.stringify(currentTodayEvents);
+  
+  return {
+    tomorrowAppeared: !hadTomorrow && hasTomorrow,
+    todayUpdated: todayChanged,
+    todayUnchanged: !todayChanged,
+  };
+}
+
+// Публікувати графік з фото та кнопками
+async function publishScheduleWithPhoto(bot, user, region, queue) {
+  try {
+    // Check if channel is paused
+    if (user.channel_paused) {
+      console.log(`Канал користувача ${user.telegram_id} зупинено, пропускаємо публікацію графіка`);
+      return;
+    }
+    
+    // Validate channel before publishing
+    try {
+      // Check if channel exists and bot has access
+      const chatInfo = await bot.api.getChat(user.channel_id);
+      
+      // Check if bot has necessary permissions
+      const botId = await ensureBotId(bot);
+      const botMember = await bot.api.getChatMember(user.channel_id, botId);
+      
+      if (botMember.status !== 'administrator' || !botMember.can_post_messages) {
+        console.log(`Бот не має прав на публікацію в канал ${user.channel_id}, оновлюємо статус`);
+        usersDb.updateChannelStatus(user.telegram_id, 'blocked');
+        
+        // Notify user about the issue
+        try {
+          await bot.api.sendMessage(
+            user.telegram_id,
+            `⚠️ <b>Канал недоступний</b>\n\n` +
+            `Бот не має доступу до вашого каналу або прав на публікацію.\n\n` +
+            `🔴 <b>Моніторинг зупинено.</b>\n\n` +
+            `Переконайтесь, що бот є адміністратором з правами на публікацію,\n` +
+            `і налаштуйте канал заново командою /setchannel`,
+            { parse_mode: 'HTML' }
+          );
+        } catch (notifyError) {
+          console.error(`Не вдалося повідомити користувача ${user.telegram_id}:`, notifyError.message);
+        }
+        
+        return;
+      }
+    } catch (validationError) {
+      // Channel not found or not accessible
+      console.error(`Канал ${user.channel_id} недоступний:`, validationError.message);
+      usersDb.updateChannelStatus(user.telegram_id, 'blocked');
+      
+      // Notify user about the issue
+      try {
+        await bot.api.sendMessage(
+          user.telegram_id,
+          `⚠️ <b>Канал недоступний</b>\n\n` +
+          `Не вдалося отримати доступ до вашого каналу.\n` +
+          `Можливо, бот був видалений або канал видалено.\n\n` +
+          `🔴 <b>Моніторинг зупинено.</b>\n\n` +
+          `Налаштуйте канал заново командою /setchannel`,
+          { parse_mode: 'HTML' }
+        );
+      } catch (notifyError) {
+        console.error(`Не вдалося повідомити користувача ${user.telegram_id}:`, notifyError.message);
+      }
+      
+      return;
+    }
+    
+    // Delete previous schedule message if delete_old_message is enabled
+    if (user.delete_old_message && user.last_schedule_message_id) {
+      try {
+        await bot.api.deleteMessage(user.channel_id, user.last_schedule_message_id);
+        console.log(`Видалено попереднє повідомлення ${user.last_schedule_message_id} з каналу ${user.channel_id}`);
+      } catch (deleteError) {
+        // Ignore errors if message was already deleted or doesn't exist
+        console.log(`Не вдалося видалити попереднє повідомлення: ${deleteError.message}`);
+      }
+    }
+    
+    // Also delete previous post if it exists (legacy)
+    if (user.last_post_id) {
+      try {
+        await bot.api.deleteMessage(user.channel_id, user.last_post_id);
+        console.log(`Видалено попередній пост ${user.last_post_id} з каналу ${user.channel_id}`);
+      } catch (deleteError) {
+        // Ignore errors if message was already deleted or doesn't exist
+        console.log(`Не вдалося видалити попередній пост: ${deleteError.message}`);
+      }
+    }
+    
+    // Отримуємо дані графіка
+    const data = await fetchScheduleData(region);
+    const scheduleData = parseScheduleForQueue(data, queue);
+    const nextEvent = findNextEvent(scheduleData);
+    
+    // Get current snapshots from user
+    const { getSnapshotHashes, updateSnapshotHashes } = require('./database/users');
+    const userSnapshots = getSnapshotHashes(user.telegram_id);
+    
+    // Use v2 snapshot logic
+    const updateTypeV2 = getUpdateTypeV2(null, scheduleData, userSnapshots);
+    
+    // Skip publication if nothing changed
+    if (!updateTypeV2.todayChanged && !updateTypeV2.tomorrowChanged) {
+      console.log(`[${user.telegram_id}] Snapshots unchanged, skipping publication`);
+      return null;
+    }
+    
+    // Update snapshots
+    const tomorrowDateToStore = updateTypeV2.hasTomorrow ? updateTypeV2.tomorrowDateStr : null;
+    updateSnapshotHashes(
+      user.telegram_id, 
+      updateTypeV2.todayHash, 
+      updateTypeV2.tomorrowHash,
+      tomorrowDateToStore
+    );
+    
+    // Calculate hash for schedule history using helper
+    const scheduleHash = calculateScheduleHash(scheduleData.events);
+    
+    // Save schedule to history
+    addScheduleToHistory(user.id, region, queue, scheduleData, scheduleHash);
+    
+    // Get previous schedule for comparison (for legacy compatibility)
+    const previousSchedule = getPreviousSchedule(user.id);
+    
+    // Compare schedules if previous exists (for changes display)
+    let hasChanges = false;
+    let changes = null;
+    let updateType = null;
+    if (previousSchedule && previousSchedule.hash !== scheduleHash) {
+      changes = compareSchedules(previousSchedule.schedule_data, scheduleData);
+      hasChanges = changes && (changes.added.length > 0 || changes.removed.length > 0 || changes.modified.length > 0);
+      // Use v2 update type for display
+      updateType = {
+        tomorrowAppeared: updateTypeV2.tomorrowAppeared,
+        todayUpdated: updateTypeV2.todayChanged,
+      };
+    }
+    
+    // Форматуємо повідомлення
+    let messageText = formatScheduleMessage(region, queue, scheduleData, nextEvent, changes, updateType, true);
+    
+    // Apply custom caption template if set
+    if (user.schedule_caption) {
+      const now = new Date();
+      
+      const variables = {
+        d: `${String(now.getDate()).padStart(2, '0')}.${String(now.getMonth() + 1).padStart(2, '0')}.${now.getFullYear()}`,
+        dm: `${String(now.getDate()).padStart(2, '0')}.${String(now.getMonth() + 1).padStart(2, '0')}`,
+        dd: 'сьогодні',
+        sdw: SHORT_DAY_NAMES[now.getDay()],
+        fdw: DAY_NAMES[now.getDay()],
+        queue: queue,
+        region: REGIONS[region]?.name || region
+      };
+      
+      messageText = formatTemplate(user.schedule_caption, variables);
+    }
+    
+    // Створюємо inline кнопки
+    const buttons = [];
+    
+    // Show timer button
+    const timerButton = { text: '⏰ Таймер', callback_data: `timer_${user.id}` };
+    
+    // Show statistics button only if router_ip is configured
+    if (user.router_ip) {
+      buttons.push([
+        timerButton,
+        { text: '📊 Статистика', callback_data: `stats_${user.id}` }
+      ]);
+    } else {
+      buttons.push([timerButton]);
+    }
+    
+    const inlineKeyboard = {
+      inline_keyboard: buttons
+    };
+    
+    let sentMessage;
+    
+    try {
+      // Завантажуємо зображення як Buffer
+      const imageBuffer = await fetchScheduleImage(region, queue);
+      
+      // Track and check capacity before publishing
+      if (capacityTracker) {
+        const canPublish = capacityTracker.canPublishToChannel(user.channel_id);
+        if (!canPublish.allowed) {
+          console.log(`Capacity limit reached for channel ${user.channel_id}: ${canPublish.reason}`);
+          // TODO: Queue the message for later instead of blocking
+          // For now, we log but continue to prevent silent failures
+          // In production, this should queue the message
+        }
+        capacityTracker.trackChannelPublish(user.channel_id);
+      }
+      
+      // Check if picture_only mode is enabled
+      if (user.picture_only) {
+        // Відправляємо тільки фото без підпису
+        sentMessage = await bot.api.sendPhoto(user.channel_id, new InputFile(imageBuffer, 'schedule.png'), {
+          reply_markup: inlineKeyboard
+        });
+      } else {
+        // Відправляємо фото з підписом та кнопками
+        sentMessage = await bot.api.sendPhoto(user.channel_id, new InputFile(imageBuffer, 'schedule.png'), {
+          caption: messageText,
+          parse_mode: 'HTML',
+          reply_markup: inlineKeyboard
+        });
+      }
+    } catch (imageError) {
+      console.log(`Зображення недоступне для ${region}/${queue}, відправляємо тільки текст`);
+      
+      // Track capacity before publishing
+      if (capacityTracker) {
+        capacityTracker.trackChannelPublish(user.channel_id);
+      }
+      
+      // Якщо не вдалося завантажити зображення, відправляємо тільки текст
+      sentMessage = await bot.api.sendMessage(user.channel_id, messageText, {
+        parse_mode: 'HTML',
+        reply_markup: inlineKeyboard
+      });
+    }
+    
+    // Save the message_id for potential deletion later
+    if (sentMessage && sentMessage.message_id) {
+      usersDb.updateLastScheduleMessageId(user.telegram_id, sentMessage.message_id);
+    }
+    
+    return sentMessage;
+    
+  } catch (error) {
+    console.error('Помилка публікації графіка:', error);
+    
+    // Track channel publish error
+    if (metricsCollector) {
+      metricsCollector.trackChannelEvent('publishErrors');
+      metricsCollector.trackError(error, { 
+        context: 'schedule_publish', 
+        channelId: user.channel_id,
+        region: region,
+        queue: queue
+      });
+    }
+    
+    throw error;
+  }
+}
+
+module.exports = {
+  publishScheduleWithPhoto,
+  getUpdateType,
+  getUpdateTypeV2,
+};
