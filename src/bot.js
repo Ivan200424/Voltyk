@@ -757,17 +757,10 @@ bot.on("callback_query:data", async (ctx) => {
     
   } catch (error) {
     console.error('Помилка обробки callback query:', error);
-    try {
-      await safeAnswerCallbackQuery(bot, query.id, {
-        text: '❌ Виникла помилка',
-        show_alert: false
-      });
-    } catch (e) {
-      // Ignore old callback queries
-      if (!e.description?.includes('query is too old')) {
-        console.error('Error answering callback query:', e.message);
-      }
-    }
+    await safeAnswerCallbackQuery(bot, query.id, {
+      text: '❌ Виникла помилка',
+      show_alert: false
+    });
   }
 });
 
