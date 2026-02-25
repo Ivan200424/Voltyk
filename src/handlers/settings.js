@@ -197,18 +197,40 @@ async function handleSettingsCallback(bot, query) {
     
     // Підтвердження зміни черги
     if (data === 'settings_region_confirm') {
+      // Відповідаємо на callback ПЕРШИМ, поки повідомлення ще існує
+      await bot.api.answerCallbackQuery(query.id);
+
       // Видаляємо попереднє повідомлення
       try {
         await bot.api.deleteMessage(chatId, query.message.message_id);
       } catch (e) {
         // Ігноруємо помилки видалення
       }
-      
-      // Запускаємо wizard в режимі редагування
-      const username = query.from.username || query.from.first_name;
-      await startWizard(bot, chatId, telegramId, username, 'edit');
-      
-      await bot.api.answerCallbackQuery(query.id);
+
+      // Запускаємо wizard в режимі редагування з fallback
+      try {
+        const username = query.from.username || query.from.first_name;
+        await startWizard(bot, chatId, telegramId, username, 'edit');
+      } catch (wizardError) {
+        console.error('Помилка запуску wizard при зміні регіону:', wizardError);
+        // Fallback: відправляємо головне меню щоб користувач не застряг
+        const { getMainMenu } = require('../keyboards/inline');
+        let botStatus = 'active';
+        if (!user.channel_id) {
+          botStatus = 'no_channel';
+        } else if (!user.is_active) {
+          botStatus = 'paused';
+        }
+        const channelPaused = user.channel_paused === 1;
+
+        await safeSendMessage(bot, chatId,
+          '😅 Не вдалося запустити зміну регіону. Спробуйте ще раз через налаштування.\n\nОберіть наступну дію:',
+          {
+            parse_mode: 'HTML',
+            ...getMainMenu(botStatus, channelPaused),
+          }
+        );
+      }
       return;
     }
     
